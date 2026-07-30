@@ -2,14 +2,13 @@ import streamlit as st
 import assemblyai as aai
 import google.generativeai as genai
 import os
+import time
 
 # ==========================================
 # 1. 🔑 从 Streamlit Secrets 读取 API Keys
 # ==========================================
-# 当应用部署在 Streamlit Cloud 时，它会自动从后台 Secrets 读取
-# 当你在本地运行测试时，它会读取本地的 .streamlit/secrets.toml 文件
-ASSEMBLYAI_KEY = st.secrets["ASSEMBLYAI_KEY"]
-GEMINI_KEY = st.secrets["GEMINI_KEY"]
+ASSEMBLYAI_KEY = st.secrets.get("ASSEMBLYAI_KEY", "你的_ASSEMBLYAI_KEY_本地测试用")
+GEMINI_KEY = st.secrets.get("GEMINI_KEY", "你的_GEMINI_KEY_本地测试用")
 
 aai.settings.api_key = ASSEMBLYAI_KEY
 genai.configure(api_key=GEMINI_KEY)
@@ -26,7 +25,6 @@ def format_time(ms):
 
 @st.cache_data(ttl=3600)
 def fetch_gemini_models(api_key):
-    """动态获取 Gemini 支持 generateContent 的可用模型列表"""
     try:
         genai.configure(api_key=api_key)
         available_models = []
@@ -38,23 +36,18 @@ def fetch_gemini_models(api_key):
     except Exception:
         return []
 
-# 页面基本设置（宽屏模式）
 st.set_page_config(page_title="会议转录与分析助手", layout="wide")
-
 st.title("我的会议录音转录与分析助手 🎙️🌐")
-st.write("上传音频文件，系统将使用 AssemblyAI 进行转录。您可以选择调用 Gemini API 进行双语对照、会议总结与待办提取。")
+st.write("已启用长音频自动切片引擎，完美支持 1 小时以上长会议的无损对照翻译。")
 
 # ==========================================
 # 2. 🎛️ 侧边栏高级设置区
 # ==========================================
 st.sidebar.header("⚙️ 参数配置")
-
-# 是否开启翻译的主开关
-enable_translation = st.sidebar.checkbox("开启 AI 翻译与分析", value=True, help="如果只需要原始文字，请取消勾选。")
+enable_translation = st.sidebar.checkbox("开启 AI 翻译与分析", value=True)
 
 if enable_translation:
     st.sidebar.markdown("---")
-    
     fetched_models = fetch_gemini_models(GEMINI_KEY)
     default_candidates = ["gemini-flash-latest", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
     all_model_options = fetched_models if fetched_models else default_candidates
@@ -65,45 +58,34 @@ if enable_translation:
     elif "gemini-1.5-flash" in all_model_options:
         default_index = all_model_options.index("gemini-1.5-flash")
 
-    selected_model = st.sidebar.selectbox(
-        "选择 Gemini 模型：",
-        options=all_model_options,
-        index=default_index
-    )
-
-    target_language = st.sidebar.selectbox(
-        "翻译目标语言：",
-        options=["英文", "中文", "日文", "德文", "法文", "韩文"],
-        index=0
-    )
+    selected_model = st.sidebar.selectbox("选择 Gemini 模型：", options=all_model_options, index=default_index)
+    target_language = st.sidebar.selectbox("翻译目标语言：", options=["英文", "中文", "日文", "德文", "法文", "韩文"], index=0)
 
     st.sidebar.markdown("---")
     st.sidebar.subheader("附加生成项")
-    
-    # 拆分为独立的总结和待办按钮
-    enable_summary = st.sidebar.checkbox("生成会议总结 (Executive Summary)", value=True)
-    enable_action_items = st.sidebar.checkbox("生成待办事项 (Action Items)", value=True)
+    enable_summary = st.sidebar.checkbox("生成会议总结", value=True)
+    enable_action_items = st.sidebar.checkbox("生成待办事项", value=True)
 
     extra_context = st.sidebar.text_area(
         "补充背景信息 / 术语表 (可选)：",
-        placeholder="例如：\n参会人员：Alice, Bob\n专业术语：ENSO (厄尔尼诺-南方涛动), A320",
+        placeholder="例如：\n参会人员：Alice, Bob\n专业术语：ENSO, A320",
         height=120
     )
 
 # ==========================================
 # 3. 📂 主界面文件上传与处理
 # ==========================================
-uploaded_file = st.file_uploader("请上传音频文件 (最高 200MB，支持 mp3, m4a)", type=['mp3', 'm4a'])
+uploaded_file = st.file_uploader("请上传音频文件 (最高 200MB，推荐先将长录音压缩为 64kbps MP3)", type=['mp3', 'm4a'])
 
 if uploaded_file is not None:
     if st.button("🚀 开始处理"):
-        with st.spinner("正在呼叫 AssemblyAI 进行语音转录，请耐心等待..."):
+        with st.spinner("正在呼叫 AssemblyAI 进行语音转录，长音频可能需要 3-5 分钟，请勿刷新页面..."):
             temp_file_name = "temp_audio" + os.path.splitext(uploaded_file.name)[1]
             with open(temp_file_name, "wb") as f:
                 f.write(uploaded_file.getbuffer())
             
             try:
-                # --- 第一阶段：语音转文字 ---
+                # --- 第一阶段：语音转文字与 10 分钟切片 ---
                 transcriber = aai.Transcriber()
                 config = aai.TranscriptionConfig(speaker_labels=True, language_code="zh")
                 transcript = transcriber.transcribe(temp_file_name, config=config)
@@ -111,76 +93,112 @@ if uploaded_file is not None:
                 if transcript.error:
                     st.error(f"转录失败: {transcript.error}")
                 else:
-                    final_text = ""
+                    st.success("🎉 转录成功！正在进行文本梳理...")
+                    
+                    # 10 分钟 = 600,000 毫秒
+                    CHUNK_DURATION_MS = 10 * 60 * 1000 
+                    chunks = []
+                    current_chunk_text = ""
+                    current_bin = -1
+                    final_full_text = "" # 用于完整展示和生成总结
+
                     for utterance in transcript.utterances:
+                        # 计算当前发言属于第几个 10 分钟区块
+                        bin_idx = utterance.start // CHUNK_DURATION_MS
+                        if current_bin == -1:
+                            current_bin = bin_idx
+                        
+                        # 如果进入了新的 10 分钟，把上一个区块保存
+                        if bin_idx > current_bin:
+                            chunks.append(current_chunk_text)
+                            current_chunk_text = ""
+                            current_bin = bin_idx
+                        
                         time_str = format_time(utterance.start)
-                        final_text += f"[{time_str}] 发言人 {utterance.speaker}: {utterance.text}\n\n"
+                        line = f"[{time_str}] 发言人 {utterance.speaker}: {utterance.text}\n\n"
+                        current_chunk_text += line
+                        final_full_text += line
                     
-                    st.success("🎉 转录成功！")
-                    
+                    # 保存最后一个区块
+                    if current_chunk_text:
+                        chunks.append(current_chunk_text)
+
                     if not enable_translation:
                         st.markdown("### 📝 原始转录 (带时间戳)")
-                        st.text_area("可全选复制 (Ctrl+A)：", value=final_text, height=600, key="raw_only")
+                        st.text_area("可全选复制 (Ctrl+A)：", value=final_full_text, height=600, key="raw_only")
                     
                     else:
-                        with st.spinner(f"Gemini ({selected_model}) 正在生成分析与对照翻译..."):
-                            model = genai.GenerativeModel(selected_model)
+                        model = genai.GenerativeModel(selected_model)
+                        
+                        # --- 第二阶段：基于全局文本生成总结与待办 (不受单次输出限制) ---
+                        summary_text = ""
+                        action_items_text = ""
+                        if enable_summary or enable_action_items:
+                            with st.spinner("正在生成全局会议概览..."):
+                                if enable_summary:
+                                    prompt_summary = f"基于以下会议转录，请用【{target_language}】写一段简明扼要的“会议核心总结 (Executive Summary)”。字数控制在 200 字以内。\n\n【会议记录原文】\n{final_full_text}"
+                                    summary_text = model.generate_content(prompt_summary).text
+                                
+                                if enable_action_items:
+                                    prompt_actions = f"基于以下会议转录，请用【{target_language}】列出明确的“待办事项与负责责任人 (Action Items)”。如果没有明确提及，请回答“暂无明确待办”。\n\n【会议记录原文】\n{final_full_text}"
+                                    action_items_text = model.generate_content(prompt_actions).text
+
+                        # --- 第三阶段：循环切片翻译 (破除输出极限) ---
+                        st.write("### 🌐 开始分块逐句对照翻译")
+                        progress_bar = st.progress(0)
+                        status_text = st.empty()
+                        
+                        final_translated_text = ""
+                        total_chunks = len(chunks)
+
+                        for i, chunk_text in enumerate(chunks):
+                            status_text.text(f"Gemini 正在处理第 {i+1}/{total_chunks} 块录音 (每块约 10 分钟)......")
                             
-                            # 构建主要翻译 Prompt
                             prompt_translate = []
                             if extra_context.strip():
                                 prompt_translate.append(f"【背景信息与术语表】\n{extra_context.strip()}\n")
                             
-                            prompt_translate.append(f"""你是一个专业的会议分析助手。请按照以下要求处理下方带时间戳的会议记录：
-1. 翻译要求：
-- 请将会议记录翻译成【{target_language}】。
+                            prompt_translate.append(f"""你是一个专业的会议分析助手。请将下方这一小块会议记录翻译成【{target_language}】。
 - 请严格采用【一句原文，紧接着一句译文】的逐句对照格式输出。
 - 格式示例：
   [00:15] 发言人 A: 我们的计划是这样的。
   [00:15] 发言人 A (译文): Our plan is like this.
-- 如果上面提供了背景信息或术语表，请在翻译中准确应用其中的专业词汇和人名。
 
-【会议记录原文】
-{final_text}""")
-                            full_prompt_trans = "\n\n".join(prompt_translate)
-                            response_trans = model.generate_content(full_prompt_trans)
-                            translated_text = response_trans.text
+【会议记录片段原文】
+{chunk_text}""")
+                            
+                            try:
+                                response_trans = model.generate_content("\n\n".join(prompt_translate))
+                                final_translated_text += response_trans.text + "\n\n"
+                            except Exception as e:
+                                final_translated_text += f"\n\n[⚠️ 第 {i+1} 块翻译由于网络或频率限制出现中断: {e}]\n\n"
+                            
+                            # 更新进度条
+                            progress_bar.progress((i + 1) / total_chunks)
+                            # 强制休息 2 秒，防止触发免费 API 频率限制
+                            time.sleep(2)
+                            
+                        status_text.text("✅ 所有区块翻译完毕！")
 
-                            # --- 第 3.5 阶段：分别生成总结和待办 ---
-                            summary_text = ""
+                        # --- 第四阶段：UI 展示 ---
+                        if enable_summary or enable_action_items:
+                            st.markdown("### 📊 会议概览")
                             if enable_summary:
-                                prompt_summary = f"基于以下会议转录，请用【{target_language}】写一段简明扼要的“会议核心总结 (Executive Summary)”。字数控制在 200 字以内。\n\n【会议记录原文】\n{final_text}"
-                                response_summary = model.generate_content(prompt_summary)
-                                summary_text = response_summary.text
-                            
-                            action_items_text = ""
+                                with st.expander("📌 会议核心总结 (Executive Summary)", expanded=True):
+                                    st.write(summary_text)
                             if enable_action_items:
-                                prompt_actions = f"基于以下会议转录，请用【{target_language}】列出明确的“待办事项与负责责任人 (Action Items)”。如果没有明确提及，请回答“暂无明确待办”。\n\n【会议记录原文】\n{final_text}"
-                                response_actions = model.generate_content(prompt_actions)
-                                action_items_text = response_actions.text
-
-                            # --- 第四阶段：UI 展示 ---
+                                with st.expander("✅ 待办事项 (Action Items)", expanded=True):
+                                    st.write(action_items_text)
+                            st.markdown("---")
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            st.markdown("### 📝 完整原始转录")
+                            st.text_area("可全选复制 (Ctrl+A)：", value=final_full_text, height=600, key="raw_col")
                             
-                            # 顶部：如果有总结或待办，就分别显示在折叠面板（expander）中
-                            if enable_summary or enable_action_items:
-                                st.markdown("### 📊 会议概览")
-                                if enable_summary:
-                                    with st.expander("📌 会议核心总结 (Executive Summary)", expanded=True):
-                                        st.write(summary_text)
-                                if enable_action_items:
-                                    with st.expander("✅ 待办事项 (Action Items)", expanded=True):
-                                        st.write(action_items_text)
-                                st.markdown("---")
-                            
-                            # 底部：双栏展示转录和翻译
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                st.markdown("### 📝 原始转录")
-                                st.text_area("可全选复制 (Ctrl+A)：", value=final_text, height=600, key="raw_col")
-                                
-                            with col2:
-                                st.markdown(f"### 🌐 双语对照翻译 ({target_language})")
-                                st.text_area("可全选复制 (Ctrl+A)：", value=translated_text, height=600, key="trans_col")
+                        with col2:
+                            st.markdown(f"### 🌐 完整双语对照翻译 ({target_language})")
+                            st.text_area("可全选复制 (Ctrl+A)：", value=final_translated_text, height=600, key="trans_col")
             
             except Exception as e:
                 st.error(f"程序运行出了点小错: {e}")
