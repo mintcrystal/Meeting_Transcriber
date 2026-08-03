@@ -38,16 +38,41 @@ def fetch_gemini_models(api_key):
 
 st.set_page_config(page_title="会议转录与分析助手", layout="wide")
 st.title("我的会议录音转录与分析助手 🎙️🌐")
-st.write("已启用长音频自动切片引擎，完美支持 1 小时以上长会议的无损对照翻译。")
+st.write("已启用长音频切片引擎与自动语种检测，完美支持多语言长会议的无损分析。")
 
 # ==========================================
 # 2. 🎛️ 侧边栏高级设置区
 # ==========================================
 st.sidebar.header("⚙️ 参数配置")
+
+# --- 新增：AssemblyAI 转录设置 ---
+st.sidebar.subheader("🎙️ 转录设置 (AssemblyAI)")
+
+# 映射字典：将用户的自然语言选择映射为代码参数
+aai_model_map = {
+    "Best (最高准确率)": aai.SpeechModel.best,
+    "Nano (极速转录)": aai.SpeechModel.nano
+}
+aai_lang_map = {
+    "自动检测 (推荐)": "auto",
+    "中文": "zh",
+    "英文 (全球)": "en",
+    "英文 (美国)": "en_us",
+    "日语": "ja",
+    "法语": "fr",
+    "德语": "de"
+}
+
+selected_aai_model_ui = st.sidebar.selectbox("选择转录模型：", options=list(aai_model_map.keys()), index=0)
+selected_aai_lang_ui = st.sidebar.selectbox("录音原始语言：", options=list(aai_lang_map.keys()), index=0)
+
+st.sidebar.markdown("---")
+
+# --- 原有：Gemini 翻译设置 ---
+st.sidebar.subheader("🌐 翻译与分析设置 (Gemini)")
 enable_translation = st.sidebar.checkbox("开启 AI 翻译与分析", value=True)
 
 if enable_translation:
-    st.sidebar.markdown("---")
     fetched_models = fetch_gemini_models(GEMINI_KEY)
     default_candidates = ["gemini-flash-latest", "gemini-1.5-flash", "gemini-1.5-pro", "gemini-pro"]
     all_model_options = fetched_models if fetched_models else default_candidates
@@ -85,9 +110,24 @@ if uploaded_file is not None:
                 f.write(uploaded_file.getbuffer())
             
             try:
-                # --- 第一阶段：语音转文字与 10 分钟切片 ---
+                # --- 第一阶段：语音转文字配置 ---
                 transcriber = aai.Transcriber()
-                config = aai.TranscriptionConfig(speaker_labels=True, language_code="zh")
+                
+                # 动态生成 AssemblyAI 配置
+                aai_config_params = {
+                    "speaker_labels": True,
+                    "speech_model": aai_model_map[selected_aai_model_ui]
+                }
+                
+                # 判断是否开启自动语种检测
+                if aai_lang_map[selected_aai_lang_ui] == "auto":
+                    aai_config_params["language_detection"] = True
+                else:
+                    aai_config_params["language_code"] = aai_lang_map[selected_aai_lang_ui]
+                
+                config = aai.TranscriptionConfig(**aai_config_params)
+                
+                # 发送转录请求
                 transcript = transcriber.transcribe(temp_file_name, config=config)
                 
                 if transcript.error:
@@ -95,20 +135,18 @@ if uploaded_file is not None:
                 else:
                     st.success("🎉 转录成功！正在进行文本梳理...")
                     
-                    # 10 分钟 = 600,000 毫秒
+                    # 10 分钟切片逻辑
                     CHUNK_DURATION_MS = 10 * 60 * 1000 
                     chunks = []
                     current_chunk_text = ""
                     current_bin = -1
-                    final_full_text = "" # 用于完整展示和生成总结
+                    final_full_text = ""
 
                     for utterance in transcript.utterances:
-                        # 计算当前发言属于第几个 10 分钟区块
                         bin_idx = utterance.start // CHUNK_DURATION_MS
                         if current_bin == -1:
                             current_bin = bin_idx
                         
-                        # 如果进入了新的 10 分钟，把上一个区块保存
                         if bin_idx > current_bin:
                             chunks.append(current_chunk_text)
                             current_chunk_text = ""
@@ -119,7 +157,6 @@ if uploaded_file is not None:
                         current_chunk_text += line
                         final_full_text += line
                     
-                    # 保存最后一个区块
                     if current_chunk_text:
                         chunks.append(current_chunk_text)
 
@@ -130,7 +167,7 @@ if uploaded_file is not None:
                     else:
                         model = genai.GenerativeModel(selected_model)
                         
-                        # --- 第二阶段：基于全局文本生成总结与待办 (不受单次输出限制) ---
+                        # --- 第二阶段：全局总结与待办 ---
                         summary_text = ""
                         action_items_text = ""
                         if enable_summary or enable_action_items:
@@ -143,7 +180,7 @@ if uploaded_file is not None:
                                     prompt_actions = f"基于以下会议转录，请用【{target_language}】列出明确的“待办事项与负责责任人 (Action Items)”。如果没有明确提及，请回答“暂无明确待办”。\n\n【会议记录原文】\n{final_full_text}"
                                     action_items_text = model.generate_content(prompt_actions).text
 
-                        # --- 第三阶段：循环切片翻译 (破除输出极限) ---
+                        # --- 第三阶段：循环切片翻译 ---
                         st.write("### 🌐 开始分块逐句对照翻译")
                         progress_bar = st.progress(0)
                         status_text = st.empty()
@@ -173,9 +210,7 @@ if uploaded_file is not None:
                             except Exception as e:
                                 final_translated_text += f"\n\n[⚠️ 第 {i+1} 块翻译由于网络或频率限制出现中断: {e}]\n\n"
                             
-                            # 更新进度条
                             progress_bar.progress((i + 1) / total_chunks)
-                            # 强制休息 2 秒，防止触发免费 API 频率限制
                             time.sleep(2)
                             
                         status_text.text("✅ 所有区块翻译完毕！")
