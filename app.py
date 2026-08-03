@@ -37,7 +37,7 @@ def fetch_gemini_models(api_key):
         return []
 
 st.set_page_config(page_title="会议转录与分析助手", layout="wide")
-st.title("我的会议录音转录与分析助手 🎙️🌐")
+st.title("会议录音转录与分析助手 🎙️🌐")
 st.write("已启用长音频切片、自动语种检测、语气词过滤与术语强化，完美支持多语言长会议的无损分析。")
 
 # ==========================================
@@ -62,7 +62,7 @@ selected_aai_lang_ui = st.sidebar.selectbox("录音原始语言：", options=lis
 # 新增：语气词过滤复选框（默认开启，表示文本干净）
 # 注意：在 AssemblyAI 的 API 中，disfluencies=True 表示"保留"语气词。
 # 所以如果用户勾选了"过滤"，传递给 API 的值应该是 False。
-filter_disfluencies = st.sidebar.checkbox("过滤语气词 (嗯/啊等)", value=True, help="去除原音中的停顿词，让转录更像书面语。取消勾选则保留原味结巴。")
+filter_disfluencies = st.sidebar.checkbox("过滤语气词 (嗯/啊等)", value=True, help="去除原音中的停顿词，让转录更像书面语。取消勾选则严格按声音转录。")
 
 st.sidebar.markdown("---")
 
