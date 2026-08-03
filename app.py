@@ -38,7 +38,7 @@ def fetch_gemini_models(api_key):
 
 st.set_page_config(page_title="会议转录与分析助手", layout="wide")
 st.title("我的会议录音转录与分析助手 🎙️🌐")
-st.write("已启用长音频切片引擎与自动语种检测，完美支持多语言长会议的无损分析。")
+st.write("已启用长音频切片、自动语种检测、语气词过滤与术语强化，完美支持多语言长会议的无损分析。")
 
 # ==========================================
 # 2. 🎛️ 侧边栏高级设置区
@@ -48,7 +48,6 @@ st.sidebar.header("⚙️ 参数配置")
 # --- AssemblyAI 转录设置 ---
 st.sidebar.subheader("🎙️ 转录设置 (AssemblyAI)")
 
-# 已删除模型选择，只保留语言检测设置
 aai_lang_map = {
     "自动检测 (推荐)": "auto",
     "中文": "zh",
@@ -58,8 +57,12 @@ aai_lang_map = {
     "法语": "fr",
     "德语": "de"
 }
-
 selected_aai_lang_ui = st.sidebar.selectbox("录音原始语言：", options=list(aai_lang_map.keys()), index=0)
+
+# 新增：语气词过滤复选框（默认开启，表示文本干净）
+# 注意：在 AssemblyAI 的 API 中，disfluencies=True 表示"保留"语气词。
+# 所以如果用户勾选了"过滤"，传递给 API 的值应该是 False。
+filter_disfluencies = st.sidebar.checkbox("过滤语气词 (嗯/啊等)", value=True, help="去除原音中的停顿词，让转录更像书面语。取消勾选则保留原味结巴。")
 
 st.sidebar.markdown("---")
 
@@ -85,10 +88,13 @@ if enable_translation:
     st.sidebar.subheader("附加生成项")
     enable_summary = st.sidebar.checkbox("生成会议总结", value=True)
     enable_action_items = st.sidebar.checkbox("生成待办事项", value=True)
+    
+    # 结合之前的术语强化逻辑
+    apply_terms_to_aai = st.sidebar.checkbox("将术语同时应用于原始转录纠错", value=True, help="勾选后，下方的术语将同时发送给转录引擎，大幅减少专有名词错别字。")
 
     extra_context = st.sidebar.text_area(
         "补充背景信息 / 术语表 (可选)：",
-        placeholder="例如：\n参会人员：Alice, Bob\n专业术语：ENSO, A320",
+        placeholder="请用逗号隔开填入专业术语和人名，\n例如：Xingjian, Lanyu, ENSO, A320",
         height=120
     )
 
@@ -108,17 +114,29 @@ if uploaded_file is not None:
                 # --- 第一阶段：语音转文字配置 ---
                 transcriber = aai.Transcriber()
                 
-                # 移除了 speech_model 参数，强制使用官方默认最新模型
                 aai_config_params = {
-                    "speaker_labels": True
+                    "speaker_labels": True,
+                    # 用户勾选了"过滤"，API 就要求不保留(False)
+                    "disfluencies": not filter_disfluencies
                 }
                 
+                # 语种检测
                 if aai_lang_map[selected_aai_lang_ui] == "auto":
                     aai_config_params["language_detection"] = True
                 else:
                     aai_config_params["language_code"] = aai_lang_map[selected_aai_lang_ui]
                 
                 config = aai.TranscriptionConfig(**aai_config_params)
+                
+                # 处理自定义术语 (word_boost)
+                if extra_context.strip() and apply_terms_to_aai:
+                    # 简单清洗：把换行变成逗号，按逗号切分，去除多余空格
+                    cleaned_string = extra_context.replace('\n', ',')
+                    terms_list = [term.strip() for term in cleaned_string.split(',') if term.strip()]
+                    if terms_list:
+                        # AssemblyAI 字典格式要求
+                        word_boost_dict = {term: [term] for term in terms_list}
+                        config.set_custom_spelling(word_boost_dict)
                 
                 transcript = transcriber.transcribe(temp_file_name, config=config)
                 
